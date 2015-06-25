@@ -1,5 +1,8 @@
 /*
-  emonTH V1.4 Low Power DHT22 Humidity & Temperature & DS18B20 Temperature Node Example 
+  openEMC Humidity, Temperature, and Equilibrium Moisture Content Node
+  
+  based on:
+  emonTH Low Power DHT22 Humidity & Temperature & DS18B20 Temperature Node Example 
 
   Checkes at startup for presence of a DS18B20 temp sensor , DHT22 (temp + humidity) or both
   If it finds both sensors the temperature value will be taken from the DS18B20 (external) and DHT22 (internal) and humidity from DHT22
@@ -23,7 +26,7 @@
 	- DallasTemperature	http://download.milesburton.com/Arduino/MaximTemperature/DallasTemperature_LATEST.zip
 
   Recommended node ID allocation
-  ------------------------------------------------------------------------------------------------------------
+  -----------------------------------------------------------------------------------------------------------
   -ID-	-Node Type- 
   0	- Special allocation in JeeLib RFM12 driver - reserved for OOK use
   1-4     - Control nodes 
@@ -33,11 +36,20 @@
   17-30	- Environmental sensing nodes (temperature humidity etc.)
   31	- Special allocation in JeeLib RFM12 driver - Node31 can communicate with nodes on any network group
   -------------------------------------------------------------------------------------------------------------
+;
+  Change log:
+  V1.5         add support for emonTH V1.5 with ATmega328 onboard, RFM69CW and RF node ID DIP switch 
+  V1.5.1      11/05/15 fix bug to make RF node ID DIP switches work 
 */
 
-#define freq RF12_433MHZ                                              // Frequency of RF12B module can be RF12_433MHZ, RF12_868MHZ or RF12_915MHZ. You should use the one matching the module you have.
-const int nodeID = 19;                                                // EmonTH temperature RFM12B node ID - should be unique on network
-const int networkGroup = 210;                                         // EmonTH RFM12B wireless network group - needs to be same as emonBase and emonGLCD
+#define RF69_COMPAT 1                                                              // Set to 1 if using RFM69CW or 0 is using RFM12B
+#include <JeeLib.h>                                                                      //https://github.com/jcw/jeelib - Tested with JeeLib 3/11/14
+
+boolean debug=1;                                       //Set to 1 to few debug serial output, turning debug off increases battery life
+
+#define RF_freq RF12_433MHZ                 // Frequency of RF12B module can be RF12_433MHZ, RF12_868MHZ or RF12_915MHZ. You should use the one matching the module you have.
+int nodeID = 19;                               // EmonTH temperature RFM12B node ID - should be unique on network
+const int networkGroup = 210;                // EmonTH RFM12B wireless network group - needs to be same as emonBase and emonGLCD
                                                                       // DS18B20 resolution 9,10,11 or 12bit corresponding to (0.5, 0.25, 0.125, 0.0625 degrees C LSB), lower resolution means lower power
 
 const int time_between_readings= 1;                                   // in minutes
@@ -46,20 +58,21 @@ const int TEMPERATURE_PRECISION=11;                                   // 9 (93.8
 
 // See block comment above for library info
 #include <avr/power.h>
-#include <avr/sleep.h>
-#include <RFu_JeeLib.h>                                                 
+#include <avr/sleep.h>                                           
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include "DHT.h"
 ISR(WDT_vect) { Sleepy::watchdogEvent(); }                            // Attached JeeLib sleep function to Atmega328 watchdog -enables MCU to be put into sleep mode inbetween readings to reduce power consumption 
 
 // Hardwired emonTH pin allocations 
-const int DS18B20_PWR=5;
-const int DHT22_PWR=6;
-const int LED=9;
-const int BATT_ADC=1;
-#define ONE_WIRE_BUS 19
-#define DHTPIN 18   
+const int DS18B20_PWR=    5;
+const int DHT22_PWR=      6;
+const int LED=            9;
+const int BATT_ADC=       1;
+const int DIP_switch1=    7;
+const int DIP_switch2=    8;
+#define ONE_WIRE_BUS      19
+#define DHTPIN            18   
 
 // Humidity code adapted from ladyada' example                        // emonTh DHT22 data pin
 // Uncomment whatever type you're using!
@@ -76,12 +89,13 @@ typedef struct {                                                      // RFM12B 
   	  int temp;
           int temp_external;
           int humidity;    
-          int battery;          	                                      
+          int battery; 
+          int emc;         	                                      
 } Payload;
 Payload emonth;
 
 
-boolean debug;
+
 int numSensors; 
 //addresses of sensors, MAX 4!!  
 byte allAddress [4][8];                                              // 8 bytes per address
@@ -92,11 +106,22 @@ void setup() {
 //################################################################################################################################
   
   pinMode(LED,OUTPUT); digitalWrite(LED,HIGH);                       // Status LED on
-   
-  rf12_initialize(nodeID, freq, networkGroup);                       // Initialize RFM12B
+     
+  //READ DIP SWITCH POSITIONS - LOW when switched on (default off - pulled up high)
+  pinMode(DIP_switch1, INPUT_PULLUP);
+  pinMode(DIP_switch2, INPUT_PULLUP);
+  boolean DIP1 = digitalRead(DIP_switch1);
+  boolean DIP2 = digitalRead(DIP_switch2);
+  
+  if ((DIP1 == HIGH) && (DIP2 == HIGH)) nodeID=nodeID;
+  if ((DIP1 == LOW) && (DIP2 == HIGH)) nodeID=nodeID+1;
+  if ((DIP1 == HIGH) && (DIP2 == LOW)) nodeID=nodeID+2;
+  if ((DIP1 == LOW) && (DIP2 == LOW)) nodeID=nodeID+3;
+  
+   rf12_initialize(nodeID, RF_freq, networkGroup);                       // Initialize RFM12B
   
   // Send RFM12B test sequence (for factory testing)
-  for (int i=0; i<10; i++)                                           
+  for (int i=10; i>-1; i--)                                         
   {
     emonth.temp=i; 
     rf12_sendNow(0, &emonth, sizeof emonth);
@@ -107,20 +132,23 @@ void setup() {
   // end of factory test sequence
   
   rf12_sleep(RF12_SLEEP);
-  
-  if (Serial) debug = 1; else debug=0;                              //if serial UART to USB is connected show debug O/P. If not then disable serial
-  
   if (debug==1)
   {
     Serial.begin(9600);
-    Serial.println("emonTH"); 
+    Serial.print(DIP1); Serial.println(DIP2);
+    Serial.println("emonTH - Firmware V1.5.1"); 
     Serial.println("OpenEnergyMonitor.org");
+    #if (RF69_COMPAT)
+      Serial.println("RFM69CW Init> ");
+    #else
+      Serial.println("RFM12B Init> ");
+    #endif
     Serial.print("Node: "); 
     Serial.print(nodeID); 
     Serial.print(" Freq: "); 
-    if (freq == RF12_433MHZ) Serial.print("433Mhz");
-    if (freq == RF12_868MHZ) Serial.print("868Mhz");
-    if (freq == RF12_915MHZ) Serial.print("915Mhz"); 
+    if (RF_freq == RF12_433MHZ) Serial.print("433Mhz");
+    if (RF_freq == RF12_868MHZ) Serial.print("868Mhz");
+    if (RF_freq == RF12_915MHZ) Serial.print("915Mhz"); 
     Serial.print(" Network: "); 
     Serial.println(networkGroup);
     delay(100);
@@ -130,6 +158,9 @@ void setup() {
   pinMode(DS18B20_PWR,OUTPUT);
   pinMode(BATT_ADC, INPUT);
   digitalWrite(DHT22_PWR,LOW);
+
+
+
 
   //################################################################################################################################
   // Power Save  - turn off what we don't need - http://www.nongnu.org/avr-libc/user-manual/group__avr__power.html
@@ -189,8 +220,11 @@ void setup() {
   else 
   {
     DS18B20=1; 
-    if (debug==1) Serial.print("Detected "); Serial.print(numSensors); Serial.println(" DS18B20");
-    if (DHT22_status==1) Serial.println("DS18B20 and DHT22 found, assuming DS18B20 is external sensor");
+    if (debug==1) {
+      Serial.print("Detected "); Serial.print(numSensors); Serial.println(" DS18B20");
+       if (DHT22_status==1) Serial.println("DS18B20 and DHT22 found, assuming DS18B20 is external sensor");
+    }
+    
   }
   if (debug==1) delay(200);
   
@@ -249,8 +283,6 @@ void loop()
   
   
   emonth.battery=int(analogRead(BATT_ADC)*0.03225806);                    //read battery voltage, convert ADC to volts x10
-                                               
-  
   
   if (debug==1) 
   {
@@ -269,6 +301,16 @@ void loop()
       Serial.print("C, DHT22 Humidity: ");
       Serial.print(emonth.humidity/10.0);
       Serial.print("%, ");
+    }
+    
+    if (DHT22_status) {
+      emonth.emc = EMCfromTH(CtoF(emonth.temp / 10.0), emonth.humidity/10.0) * 10.0;
+      Serial.print("EMC: ");
+      Serial.print(emonth.emc / 10.0);
+      Serial.print("%, ");
+    }
+    else {
+      emonth.emc = 0;
     }
     
     Serial.print("Battery voltage: ");  
@@ -311,5 +353,22 @@ void dodelay(unsigned int ms)
   ADCSRA=oldADCSRA;         // restore ADC state
   ADCSRB=oldADCSRB;
   ADMUX=oldADMUX;
+}
+
+float EMCfromTH(float T, float H) {
+  // formula from this page: http://www.csgnetwork.com/emctablecalc.html
+  
+  H /= 100;
+  float Tsquared = T * T;
+  float W = 330 + 0.452 * T + 0.00415 * Tsquared;
+  float K = 0.791 + 0.000463 * T - 0.000000844 * Tsquared;
+  float Ka = 6.34 + 0.000775 * T - 0.0000935 * Tsquared;
+  float Kb = 1.09 + 0.0284 * T - 0.0000904 * Tsquared;
+  float M = 1800 / W * ( K * H / (1 - K * H) + (Ka * K * H + 2 * Ka * Kb * K * K * H * H) / (1 + Ka * K * H + Ka * Kb * K * K * H * H)); 
+  return M;
+}
+
+float CtoF(float C) {
+  return C * 1.8 + 32.0;
 }
 
